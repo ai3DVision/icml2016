@@ -9,6 +9,8 @@ require 'nngraph'
 require 'optim'
 
 opt = {
+   c = 0.01,               -- bound for weight clipping of the critic
+   ncritic = 5,            -- #  of training iterations of D for 1 iteration of G
    numCaption = 1,
    large = 0,
    save_every = 100,
@@ -30,7 +32,7 @@ opt = {
    ndf = 64,               -- #  of discrim filters in first conv layer
    nThreads = 4,           -- #  of data loading threads to use
    niter = 1000,             -- #  of iter at starting learning rate
-   lr = 0.0002,            -- initial learning rate for adam
+   lr = 5e-5,            -- initial learning rate for adam
    lr_decay = 0.5,            -- initial learning rate for adam
    decay_every = 100,
    beta1 = 0.5,            -- momentum term of adam
@@ -84,7 +86,7 @@ local nz = opt.nz
 local ndf = opt.ndf
 local ngf = opt.ngf
 local real_label = 1
-local fake_label = 0
+local fake_label = -1
 
 local SpatialBatchNormalization = nn.SpatialBatchNormalization
 local SpatialConvolution = nn.SpatialConvolution
@@ -253,7 +255,7 @@ else
   netD = torch.load(opt.init_d)
 end
 
-local criterion = nn.BCECriterion()
+-- local criterion = nn.BCECriterion()
 ---------------------------------------------------------------------------
 optimStateG = {
    learningRate = opt.lr,
@@ -291,7 +293,7 @@ if opt.gpu > 0 then
    netD:cuda()
    netG:cuda()
 
-   criterion:cuda()
+   -- criterion:cuda()
 end
 
 if opt.use_cudnn == 1 then
@@ -323,12 +325,15 @@ local fDx = function(x)
 
   gradParametersD:zero()
 
+  -- clamp parameters
+  parametersD:clamp(-opt.c, opt.c)
+
   -- train with real
   label:fill(real_label)
   local output = netD:forward{input_img, input_txt_emb1}
-  local errD_real = criterion:forward(output, label)
-  local df_do = criterion:backward(output, label)
-  netD:backward({input_img, input_txt_emb1}, df_do)
+  local errD_real = output:mean() -- criterion:forward(output, label)
+  -- local df_do = criterion:backward(output, label)
+  netD:backward({input_img, input_txt_emb1}, label)
 
   errD_wrong = 0
   if opt.cls_weight > 0 then
@@ -336,10 +341,11 @@ local fDx = function(x)
     label:fill(fake_label)
 
     local output = netD:forward{input_img2, input_txt_emb1}
-    errD_wrong = opt.cls_weight*criterion:forward(output, label)
-    local df_do = criterion:backward(output, label)
-    df_do:mul(opt.cls_weight)
-    netD:backward({input_img2, input_txt_emb1}, df_do)
+    errD_wrong = opt.cls_weight*output:mean() -- opt.cls_weight*criterion:forward(output, label)
+    -- local df_do = criterion:backward(output, label)
+    -- df_do:mul(opt.cls_weight)
+    label:mul(opt.cls_weight)
+    netD:backward({input_img2, input_txt_emb1}, label)
   end
 
   -- train with fake
@@ -358,12 +364,13 @@ local fDx = function(x)
   local cur_score = output:mean()
   fake_score = 0.99 * fake_score + 0.01 * cur_score
 
-  local errD_fake = criterion:forward(output, label)
-  local df_do = criterion:backward(output, label)
+  local errD_fake = output:mean() -- criterion:forward(output, label)
+  -- local df_do = criterion:backward(output, label)
   local fake_weight = 1 - opt.cls_weight
   errD_fake = errD_fake*fake_weight
-  df_do:mul(fake_weight)
-  netD:backward({input_img, input_txt_emb1}, df_do)
+  -- df_do:mul(fake_weight)
+  label:mul(fake_weight)
+  netD:backward({input_img, input_txt_emb1}, label)
 
   errD = errD_real + errD_fake + errD_wrong
   errW = errD_wrong
@@ -392,9 +399,9 @@ local fGx = function(x)
   local cur_score = output:mean()
   fake_score = 0.99 * fake_score + 0.01 * cur_score
 
-  errG = criterion:forward(output, label)
-  local df_do = criterion:backward(output, label)
-  local df_dg = netD:updateGradInput({input_img, input_txt_emb1}, df_do)
+  errG = output:mean() -- criterion:forward(output, label)
+  -- local df_do = criterion:backward(output, label)
+  local df_dg = netD:updateGradInput({input_img, input_txt_emb1}, label)
 
   netG:backward({noise, input_txt_emb1}, df_dg[1])
   return errG, gradParametersG
@@ -402,6 +409,7 @@ end
 
 
 -- train
+local counter = 0
 for epoch = 1, opt.niter do
   epoch_tm:reset()
 
@@ -413,9 +421,23 @@ for epoch = 1, opt.niter do
   for i = 1, math.min(data:size(), opt.ntrain), opt.batchSize do
     tm:reset()
 
-    sample()
-    optim.adam(fDx, parametersD, optimStateD)
-    optim.adam(fGx, parametersG, optimStateG)
+    -- train the critic longer at the beginning
+    local Diter
+    if counter <= 25 then
+        Diter = 100
+    else
+        Diter = opt.ncritic
+    end
+    -- (1) Update critic
+    for j = 1, Diter do
+        sample()
+        optim.rmsprop(fDx, parametersD, optimStateD)
+    end
+
+    -- (2) Update generator
+    optim.rmsprop(fGx, parametersG, optimStateG)
+
+    counter = counter + 1
 
     -- logging
     if ((i-1) / opt.batchSize) % opt.print_every == 0 then
